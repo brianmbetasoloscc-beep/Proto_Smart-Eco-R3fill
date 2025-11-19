@@ -1,0 +1,263 @@
+#include <LiquidCrystal_I2C.h>
+#include <HX711.h>
+#include <Servo.h>
+
+// --- LCD (I2C 16x2) ---
+LiquidCrystal_I2C lcd(0x27,16,2);
+
+// --- HX711 Pins ---
+#define LOADCELL_DOUT_PIN A0
+#define LOADCELL_SCK_PIN  A1
+
+// --- Ultrasonic Pins ---
+#define TRIG_PIN 10
+#define ECHO_PIN 11
+
+// --- Relay Pins (4-Channel Relay Module) ---
+#define RELAY_HOT_WATER   4  // Relay 1 - Hot water solenoid valve
+#define RELAY_COLD_WATER  5  // Relay 2 - Cold water solenoid valve
+#define RELAY_3           6  // Relay 3 - Reserved for future use
+#define RELAY_4           7  // Relay 4 - Reserved for future use
+
+// --- Other Pins ---
+#define BUZZER_PIN 8
+#define SERVO_PIN  9
+
+HX711 scale;
+Servo gateServo;
+
+// --- HX711 Scaling ---
+float kg1_raw = 280.0; 
+float grams_per_unit = 2.383;  // calibration factor (adjust this if needed)
+
+// --- Detection Settings ---
+float weightThreshold = 50.0;     // grams, sudden increase
+int distanceThreshold = 12;       // cm
+unsigned long detectionWindow = 1500;
+unsigned long cooldownTime = 1500;
+
+unsigned long cooldownStart = 0;
+bool inCooldown = false;
+bool itemProcessing = false;
+
+float lastWeight = 0.0;
+unsigned long itemDetectTime = 0;
+
+// --- Water Dispensing Settings ---
+float mlPerSecond = 50.0;  // Adjust based on your solenoid valve flow rate
+
+void setup() {
+  Serial.begin(9600);
+
+  lcd.init();
+  lcd.backlight();
+  showIdleScreen();
+
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.tare(); // zero the scale
+  delay(500);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  gateServo.attach(SERVO_PIN);
+  gateServo.write(0);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // --- Initialize Relay Module (Active LOW relays) ---
+  pinMode(RELAY_HOT_WATER, OUTPUT);
+  pinMode(RELAY_COLD_WATER, OUTPUT);
+  pinMode(RELAY_3, OUTPUT);
+  pinMode(RELAY_4, OUTPUT);
+  
+  // Turn OFF all relays (HIGH = OFF for active-low relays)
+  digitalWrite(RELAY_HOT_WATER, HIGH);
+  digitalWrite(RELAY_COLD_WATER, HIGH);
+  digitalWrite(RELAY_3, HIGH);
+  digitalWrite(RELAY_4, HIGH);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // --- Cooldown ---
+  if (inCooldown && (now - cooldownStart >= cooldownTime)) {
+    inCooldown = false;
+    showIdleScreen();
+  }
+
+  // --- Read weight ---
+  float weight = 0.0;
+  if(scale.is_ready()){
+    long raw = scale.read();
+    weight = raw * grams_per_unit; // scale raw value to grams
+    if(weight < 0) weight = 0;
+    Serial.print("Raw: "); Serial.print(raw);
+    Serial.print(" | Weight: "); Serial.println(weight);
+  }
+
+  // --- Update LCD with weight (always update when not in special screens) ---
+  if (!itemProcessing && !inCooldown) {
+    lcd.setCursor(0,1);
+    lcd.print("Weight: ");
+    lcd.print(weight,1);
+    lcd.print(" g   "); // clear old digits
+  }
+
+  // --- Ultrasonic ---
+  int distance = getUltrasonicDistance();
+
+  // --- Detect item ---
+  if (!itemProcessing && !inCooldown) {
+    if (distance < distanceThreshold && (weight - lastWeight > weightThreshold)) {
+      itemProcessing = true;
+      itemDetectTime = now;
+
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("Item detected!");
+      lcd.setCursor(0,1);
+      lcd.print("Checking...");
+    }
+  }
+
+  // --- Classification ---
+  if (itemProcessing) {
+    if (distance < distanceThreshold) {
+      itemProcessing = false;
+      handleAccept(weight);
+    } else if (now - itemDetectTime > detectionWindow) {
+      itemProcessing = false;
+      handleReject();
+    }
+  }
+
+  lastWeight = weight;
+  delay(100);
+}
+
+// --- Ultrasonic distance ---
+int getUltrasonicDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000);
+  int distance = duration * 0.034 / 2;
+
+  if (distance == 0 || distance > 400) return 999;
+  return distance;
+}
+
+// --- ACCEPT LOGIC ---
+void handleAccept(float measuredWeight) {
+  beep(100);
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("ACCEPT");
+  lcd.setCursor(0,1);
+  lcd.print("Measuring...");
+
+  delay(3000);
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Weight: ");
+  lcd.print(measuredWeight,1);
+  lcd.print(" g");
+
+  lcd.setCursor(0,1);
+  lcd.print("Volume: ");
+  lcd.print(measuredWeight,1);
+  lcd.print(" ml");
+
+  delay(2000);
+
+  // --- NEW: Dispense water (cold water by default) ---
+  dispenseWater(measuredWeight, false); // false = cold water
+
+  cooldownStart = millis();
+  inCooldown = true;
+}
+
+// --- REJECT LOGIC ---
+void handleReject() {
+  beep(200);
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Rejected!");
+  lcd.setCursor(0,1);
+  lcd.print("Try again!");
+
+  gateServo.write(90);
+  delay(700);
+  gateServo.write(0);
+
+  cooldownStart = millis();
+  inCooldown = true;
+}
+
+// --- NEW FUNCTION: DISPENSE WATER ---
+void dispenseWater(float volumeML, bool isHot) {
+  int relayPin = isHot ? RELAY_HOT_WATER : RELAY_COLD_WATER;
+  String tempType = isHot ? "HOT" : "COLD";
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Dispensing...");
+  lcd.setCursor(0,1);
+  lcd.print(tempType);
+  lcd.print(" ");
+  lcd.print(volumeML,1);
+  lcd.print("ml");
+
+  // Calculate dispensing time (1g = 1ml)
+  float timeNeeded = (volumeML / mlPerSecond) * 1000; // convert to milliseconds
+  
+  // Activate solenoid valve (LOW = ON for active-low relay)
+  digitalWrite(relayPin, LOW);
+  
+  Serial.print("Dispensing ");
+  Serial.print(volumeML);
+  Serial.print("ml of ");
+  Serial.print(tempType);
+  Serial.print(" water for ");
+  Serial.print(timeNeeded);
+  Serial.println("ms");
+
+  delay(timeNeeded);
+
+  // Deactivate solenoid valve (HIGH = OFF)
+  digitalWrite(relayPin, HIGH);
+
+  // Show completion
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Done!");
+  lcd.setCursor(0,1);
+  lcd.print("Thank you!");
+
+  beep(100);
+  delay(2000);
+}
+
+// --- BEEP ---
+void beep(unsigned int ms) {
+  digitalWrite(BUZZER_PIN,HIGH);
+  delay(ms);
+  digitalWrite(BUZZER_PIN,LOW);
+}
+
+// --- IDLE SCREEN ---
+void showIdleScreen() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Eco-R3fill");
+  lcd.setCursor(0,1);
+  lcd.print("Insert item");
+}
